@@ -1,35 +1,23 @@
-#![allow(clippy::all)]
-#![allow(warnings, unused)]
+#![allow(unused_variables)]
 mod afc;
 mod bindings;
+mod housearrest;
+mod instproxy;
 use afc::*;
 pub(crate) use bindings::*;
-use once_cell::sync::Lazy;
-use std::io::Write;
+use std::sync::OnceLock;
 use std::{
-    any::Any,
-    collections::HashMap,
     ffi::{CStr, CString},
-    io::Read,
-    mem::{zeroed, MaybeUninit},
-    net::{TcpStream, UdpSocket},
-    os::{
-        raw::{c_char, c_void},
-        windows::io::FromRawSocket,
-    },
-    path::Path,
+    mem::MaybeUninit,
+    os::raw::c_void,
     str,
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        Mutex,
-    },
-    time::Duration,
 };
 
 const AFC_SERVICE_NAME: &str = "com.apple.afc";
-const G_BLOCKSIZE: u64 = 4096;
+const HOUSE_ARREST_SERVICE_NAME: &str = "com.apple.mobile.house_arrest";
+const INST_PROXY: &str = "com.apple.mobile.installation_proxy";
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Device {
     pub(crate) pointer: usize,
 }
@@ -45,27 +33,47 @@ impl Device {
         self.pointer as _
     }
 }
-impl Default for Device {
-    fn default() -> Self {
-        Self { pointer: 0 }
-    }
-}
 
-static mut DEVICE: Lazy<Device> = Lazy::new(|| Device::default());
-static mut CLIENT: Lazy<AfcClient> = Lazy::new(|| AfcClient::default());
+static DEVICE: OnceLock<Device> = OnceLock::new();
+static CLIENT: OnceLock<Client> = OnceLock::new();
+static HOUSE_ARREST: OnceLock<bool> = OnceLock::new();
 
+// c:\iphone -h com.google.chrome.ios -f
 fn main() {
     unsafe {
         let argv: Vec<String> = std::env::args().collect();
+        let has_front_arg = argv.contains(&"-f".to_string());
+        let list_apps = argv.contains(&"-apps".to_string());
+        let mut use_house_arrest = false;
+        let mut app_id = String::new();
         let mut opt = Vec::new();
-        argv.into_iter().for_each(|a| {
-            let c = CString::new(a).unwrap();
-            opt.push(c.into_raw());
-        });
+        if !list_apps {
+            let mut args = argv.into_iter();
+            while let Some(arg) = args.next() {
+                if arg == "-h" {
+                    use_house_arrest = true;
+                    if let Some(appid) = args.next() {
+                        println!("next:{}", appid);
+                        app_id = appid
+                    } else {
+                        println!("Invalid arguments: missing app id");
+                        return;
+                    }
+                    continue;
+                }
+                let c = CString::new(arg).unwrap();
+                opt.push(c.into_raw());
+            }
 
-        if opt.len() <= 1 {
-            println!("Invalid arguments");
-            return;
+            if opt.len() <= 1 {
+                println!("No mount point");
+                return;
+            }
+
+            if has_front_arg {
+                let c = CString::new("-f").unwrap();
+                opt.push(c.into_raw());
+            }
         }
 
         println!("Finding device connected...");
@@ -76,7 +84,6 @@ fn main() {
             std::ptr::null(),
             idevice_options_IDEVICE_LOOKUP_USBMUX | idevice_options_IDEVICE_LOOKUP_NETWORK,
         );
-
         if res != idevice_error_t_IDEVICE_E_SUCCESS {
             println!("No device found");
             return;
@@ -97,8 +104,25 @@ fn main() {
 
         let client = client.assume_init();
 
-        println!("Starting lockdown service...");
-        let service_name = CString::new(AFC_SERVICE_NAME).unwrap();
+        HOUSE_ARREST.get_or_init(|| use_house_arrest);
+
+        println!(
+            "Starting {}lockdown service...",
+            if use_house_arrest {
+                "house_arrest "
+            } else if list_apps {
+                "instproxy "
+            } else {
+                ""
+            }
+        );
+        let service_name = if use_house_arrest {
+            CString::new(HOUSE_ARREST_SERVICE_NAME).unwrap()
+        } else if list_apps {
+            CString::new(INST_PROXY).unwrap()
+        } else {
+            CString::new(AFC_SERVICE_NAME).unwrap()
+        };
         let mut descriptor = MaybeUninit::<lockdownd_service_descriptor_t>::zeroed();
         let descriptor_ptr = descriptor.as_mut_ptr();
         let res = lockdownd_start_service(client, service_name.as_ptr(), descriptor_ptr);
@@ -111,8 +135,30 @@ fn main() {
 
         let service_descriptor = descriptor.assume_init();
 
-        if let Some(afc_client) = AfcClient::new(device, service_descriptor) {
-            *CLIENT = afc_client;
+        if let Some(afc_client) = Client::new(device, service_descriptor) {
+            if use_house_arrest && afc_client.start_house_arrest(app_id) < 0 {
+                println!("Cannot start_house_arrest");
+                lockdownd_client_free(client);
+                idevice_free(device);
+                return;
+            }
+
+            if list_apps {
+                println!("Start listing apps...");
+                if let Some(apps) = afc_client.list_apps() {
+                    for app in apps {
+                        if app.contains_key("UIFileSharingEnabled") {
+                            println!("{:?}", app);
+                        }
+                    }
+                }
+                afc_client.close();
+                lockdownd_client_free(client);
+                idevice_free(device);
+                return;
+            }
+
+            CLIENT.get_or_init(|| afc_client);
         } else {
             println!("Cannot create AfcClient");
             lockdownd_client_free(client);
@@ -120,7 +166,7 @@ fn main() {
             return;
         }
 
-        *DEVICE = device.into();
+        DEVICE.get_or_init(|| device.into());
         lockdownd_client_free(client);
 
         let args = fuse_args {
@@ -128,20 +174,38 @@ fn main() {
             argv: opt.as_mut_ptr(),
             allocated: 0,
         };
+
         let operations = get_fuse_operations();
 
         println!("Start fuse");
 
-        let res = fuse_main_real(
+        fuse_main_real(
             args.argc,
             args.argv,
             &operations as *const _,
             size_of::<fuse_operations>() as _,
             std::ptr::null_mut(),
         );
+    }
+}
 
-        /*.\fuse.exe C:/iphone -f */
-        /*  .\dokanctl.exe /u C:/iphone */
+fn real_path(path: *const i8) -> String {
+    let raw = unsafe { CStr::from_ptr(path) }
+        .to_string_lossy()
+        .to_string();
+
+    if !HOUSE_ARREST.get().unwrap() {
+        return raw;
+    }
+
+    if &raw == "." || &raw == ".." {
+        raw
+    } else if &raw == "/" {
+        "Documents".to_string()
+    } else if raw.starts_with('/') {
+        format!("Documents{}", raw)
+    } else {
+        format!("Documents/{}", raw)
     }
 }
 
@@ -150,18 +214,21 @@ unsafe extern "C" fn ifuse_init(con: *mut fuse_conn_info) -> *mut c_void {
     std::ptr::null_mut() as _
 }
 
-unsafe extern "C" fn ifuse_cleanup(data: *mut c_void) {
-    if CLIENT.close() == 0 {
-        println!("usbmuxd_disconnect");
+unsafe extern "C" fn ifuse_cleanup(_data: *mut c_void) {
+    if CLIENT.get().unwrap().close() == 0 {
+        println!("Connection closed...");
     }
 
-    if idevice_free(DEVICE.pointer()) == idevice_error_t_IDEVICE_E_SUCCESS {
-        println!("idevice_free")
+    if idevice_free(DEVICE.get().unwrap().pointer()) == idevice_error_t_IDEVICE_E_SUCCESS {
+        println!("iDevice freed...")
     }
 }
 
 unsafe extern "C" fn ifuse_getattr(path: *const i8, stbuf: *mut stat) -> i32 {
-    let info = CLIENT.get_file_info(path);
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .get_file_info(CString::new(real_path(path)).unwrap().as_ptr());
 
     std::ptr::write_bytes(stbuf, 0, 1);
     if let Some(list) = extract_list(info) {
@@ -231,27 +298,32 @@ unsafe extern "C" fn ifuse_readdir(
     offset: u64,
     fi: *mut fuse_file_info,
 ) -> i32 {
-    let info = CLIENT.read_directory(path);
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .read_directory(CString::new(real_path(path)).unwrap().as_ptr());
 
-    if let Some(dirs) = extract_list(info) {
-        if let Some(filter) = filter {
-            for dir in dirs {
-                let dir = CString::new(dir).unwrap();
-                filter(buf, dir.as_ptr(), std::ptr::null(), 1);
+    if info.status == afc_error_t_AFC_E_SUCCESS {
+        if let Some(dirs) = extract_list(info) {
+            if let Some(filter) = filter {
+                for dir in dirs {
+                    let dir = CString::new(dir).unwrap();
+                    filter(buf, dir.as_ptr(), std::ptr::null(), 1);
+                }
             }
+            return 0;
+        } else {
+            return -1;
         }
-
-        return 0;
     }
-
     -1
 }
 
 unsafe extern "C" fn ifuse_statfs(path: *const i8, stats: *mut statvfs) -> i32 {
-    let info = CLIENT.get_device_info();
+    let info = CLIENT.get().unwrap().get_device_info();
 
-    if info.is_none() {
-        return -1;
+    if info.status != afc_error_t_AFC_E_SUCCESS {
+        return -info.status;
     }
 
     let mut totalspace = 0u64;
@@ -296,7 +368,7 @@ unsafe extern "C" fn ifuse_statfs(path: *const i8, stats: *mut statvfs) -> i32 {
 }
 
 unsafe extern "C" fn ifuse_release(path: *const i8, fi: *mut fuse_file_info) -> i32 {
-    CLIENT.file_close((*fi).fh);
+    CLIENT.get().unwrap().file_close((*fi).fh);
     0
 }
 
@@ -315,7 +387,10 @@ unsafe extern "C" fn ifuse_open(path: *const i8, fi: *mut fuse_file_info) -> i32
         return -EPERM;
     }
 
-    let info = CLIENT.file_open(path, mode);
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .file_open(CString::new(real_path(path)).unwrap().as_ptr(), mode);
 
     if let Some(res) = extract_num(info) {
         (*fi).fh = res;
@@ -350,7 +425,6 @@ fn get_afc_file_mode(flags: u32) -> afc_file_mode_t {
     }
 }
 
-const MAXIMUM_READ_SIZE: u64 = 4 * 1024_u64.pow(2); // 4 MB
 unsafe extern "C" fn ifuse_read(
     path: *const i8,
     buf: *mut i8,
@@ -362,14 +436,16 @@ unsafe extern "C" fn ifuse_read(
         return 0;
     }
 
-    let info = CLIENT.file_seek((*fi).fh, offset, SEEK_SET as _);
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .file_seek((*fi).fh, offset as i64, SEEK_SET as _);
 
-    let res = parse_status(info);
-    if res != 0 {
-        return -res;
+    if info.status != afc_error_t_AFC_E_SUCCESS {
+        return -info.status;
     }
 
-    let info = CLIENT.file_read((*fi).fh, size as _);
+    let info = CLIENT.get().unwrap().file_read((*fi).fh, size as _);
 
     let mut bytes = Vec::new();
     if let Some(byte) = extract_byte(info) {
@@ -386,6 +462,7 @@ unsafe extern "C" fn ifuse_read(
 }
 
 unsafe extern "C" fn ifuse_create(path: *const i8, mode: u64, fi: *mut fuse_file_info) -> i32 {
+    println!("ifuse_create");
     ifuse_open(path, fi)
 }
 
@@ -397,50 +474,60 @@ unsafe extern "C" fn ifuse_write(
     fi: *mut fuse_file_info,
 ) -> i32 {
     println!("ifuse_write");
-    // if size == 0 {
-    //     return 0;
-    // }
+    if size == 0 {
+        return 0;
+    }
 
-    // let info = CLIENT.file_seek((*fi).fh, offset, SEEK_SET as _);
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .file_seek((*fi).fh, offset as _, SEEK_SET as _);
+    if info.status != afc_error_t_AFC_E_SUCCESS {
+        return -info.status;
+    }
 
-    // let res = parse_status(info);
-    // if res != 0 {
-    //     return -res;
-    // }
-
-    // let mut bytes = Vec::new();
-    // let info = CLIENT.file_write((*fi).fh, buf, size);
-    // if let Some(byte) = extract_byte(info) {
-    //     bytes.extend(byte);
-    // }
-
-    // bytes.len() as _
-    0
+    let info = CLIENT.get().unwrap().file_write((*fi).fh, buf, size);
+    if info.status != afc_error_t_AFC_E_SUCCESS {
+        return -info.status;
+    }
+    size as _
 }
 
 unsafe extern "C" fn ifuse_truncate(path: *const i8, size: u64) -> i32 {
-    // CLIENT.truncate(path, size);
     println!("ifuse_truncate");
-    -1
-}
-
-unsafe extern "C" fn ifuse_ftruncate(path: *const i8, size: u64, fi: *mut fuse_file_info) -> i32 {
-    println!("ifuse_ftruncate");
-    // CLIENT.truncate(path, size);
-    -1
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .truncate(CString::new(real_path(path)).unwrap().as_ptr(), size);
+    if info.status != afc_error_t_AFC_E_SUCCESS {
+        return -info.status;
+    }
+    0
 }
 
 unsafe extern "C" fn ifuse_unlink(path: *const i8) -> i32 {
     println!("ifuse_unlink");
-    // let info = CLIENT.remove_path(path);
-    // println!("{:?}", info);
-    // let res = parse_status(info);
-    // if res != 0 {
-    //     return -res;
-    // }
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .remove_path(CString::new(real_path(path)).unwrap().as_ptr());
+    if info.status != afc_error_t_AFC_E_SUCCESS {
+        return -info.status;
+    }
+    0
+}
 
-    // 0
-    -1
+unsafe extern "C" fn ifuse_mkdir(path: *const i8, ignored: u64) -> i32 {
+    println!("ifuse_mkdir");
+
+    let info = CLIENT
+        .get()
+        .unwrap()
+        .make_directory(CString::new(real_path(path)).unwrap().as_ptr());
+    if info.status != afc_error_t_AFC_E_SUCCESS {
+        return -info.status;
+    }
+    0
 }
 
 unsafe extern "C" fn ifuse_fsync(path: *const i8, datasync: i32, fi: *mut fuse_file_info) -> i32 {
@@ -449,14 +536,37 @@ unsafe extern "C" fn ifuse_fsync(path: *const i8, datasync: i32, fi: *mut fuse_f
 }
 
 unsafe extern "C" fn ifuse_chmod(path: *const i8, mode: u64) -> i32 {
+    println!("ifuse_fsync");
     0
 }
 
 unsafe extern "C" fn ifuse_chown(file: *const i8, user: u32, group: u32) -> i32 {
+    println!("ifuse_fsync");
     0
 }
 
 unsafe extern "C" fn ifuse_readlink(a: *const i8, b: *mut i8, c: u32) -> i32 {
+    println!("ifuse_readlink");
+    0
+}
+
+unsafe extern "C" fn ifuse_symlink(a: *const i8, b: *const i8) -> i32 {
+    println!("ifuse_symlink");
+    0
+}
+
+unsafe extern "C" fn ifuse_link(a: *const i8, b: *const i8) -> i32 {
+    println!("ifuse_link");
+    0
+}
+
+unsafe extern "C" fn ifuse_rename(a: *const i8, b: *const i8) -> i32 {
+    println!("ifuse_rename");
+    0
+}
+
+unsafe extern "C" fn ifuse_utimens(a: *const i8, b: *const timespec) -> i32 {
+    println!("ifuse_utimens");
     0
 }
 
@@ -465,19 +575,19 @@ pub fn get_fuse_operations() -> fuse_operations {
         getattr: Some(ifuse_getattr),
         statfs: Some(ifuse_statfs),
         readdir: Some(ifuse_readdir),
-        mkdir: None,
-        rmdir: None,
+        mkdir: Some(ifuse_mkdir),
+        rmdir: Some(ifuse_unlink),
         create: Some(ifuse_create),
         open: Some(ifuse_open),
         read: Some(ifuse_read),
         write: Some(ifuse_write),
         truncate: Some(ifuse_truncate),
         readlink: Some(ifuse_readlink),
-        symlink: None,
-        link: None,
+        symlink: Some(ifuse_symlink),
+        link: Some(ifuse_link),
         unlink: Some(ifuse_unlink),
-        rename: None,
-        utimens: None,
+        rename: Some(ifuse_rename),
+        utimens: Some(ifuse_utimens),
         fsync: Some(ifuse_fsync),
         chmod: Some(ifuse_chmod),
         chown: Some(ifuse_chown),
