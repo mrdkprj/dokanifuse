@@ -6,6 +6,8 @@ license = "MIT"
 
 [dependencies]
 byteorder = "1.5.0"
+clap =  { version = "4.5.51", features = ["derive"] }
+ctrlc = "3.5.1"
 num-derive = "0.4.2"
 num-traits = "0.2.19"
 plist = "1.8.0"

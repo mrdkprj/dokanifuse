@@ -89,7 +89,6 @@ impl Client {
                 for (k, v) in x.as_dictionary().unwrap() {
                     map.insert(k.to_string(), v.as_string().unwrap_or("").to_string());
                 }
-                // println!("{:?}", map);
                 results.push(map);
             }
 
@@ -108,5 +107,31 @@ impl Client {
         }
 
         Some(results)
+    }
+}
+
+pub(crate) fn print_app(sharing_only: bool, info: Vec<HashMap<String, String>>) {
+    for app in info {
+        if sharing_only {
+            if app.contains_key("UIFileSharingEnabled") {
+                println!("CFBundleDisplayName:{:?}, CFBundleIdentifier:{:?}, CFBundleVersion:{:?}, UIFileSharingEnabled:{:?}",
+                    app.get("CFBundleDisplayName").unwrap().to_string(),
+                    app.get("CFBundleIdentifier").unwrap().to_string(),
+                    app.get("CFBundleVersion")
+                        .unwrap_or(&String::new())
+                        .to_string(),
+                    app.contains_key("UIFileSharingEnabled").to_string(),
+                );
+            }
+        } else {
+            println!("CFBundleDisplayName:{:?}, CFBundleIdentifier:{:?}, CFBundleVersion:{:?}, UIFileSharingEnabled:{:?}",
+                    app.get("CFBundleDisplayName").unwrap().to_string(),
+                    app.get("CFBundleIdentifier").unwrap().to_string(),
+                    app.get("CFBundleVersion")
+                        .unwrap_or(&String::new())
+                        .to_string(),
+                    app.contains_key("UIFileSharingEnabled").to_string(),
+            );
+        }
     }
 }

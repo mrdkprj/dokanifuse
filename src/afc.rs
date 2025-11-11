@@ -1,6 +1,6 @@
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 #![allow(clippy::upper_case_acronyms)]
-use crate::bindings::*;
+use crate::{bindings::*, debug};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
 use std::{collections::HashMap, ffi::CStr, mem::MaybeUninit, slice::from_raw_parts, sync::Mutex};
@@ -299,7 +299,7 @@ impl Client {
                     /* check if it's a valid AFC header */
                     /* check if it has the correct packet number */
                     if AFCMAGIC != &response_magic || packet_num != response_packet_pnum {
-                        println!("Invalid response header");
+                        debug!("Invalid response header");
                         None
                     } else {
                         Some(response_header)
@@ -309,11 +309,11 @@ impl Client {
                 }
             }
             idevice_error_t_IDEVICE_E_TIMEOUT => {
-                println!("TCP timeout");
+                debug!("TCP timeout");
                 None
             }
             val => {
-                println!("TCP error: {:?}", val);
+                debug!("TCP error: {:?}", val);
                 None
             }
         };
@@ -321,14 +321,14 @@ impl Client {
         /* then, read the attached packet */
         if let Some(response_header) = response_header {
             if response_header.this_length < std::mem::size_of::<AfcHeader>() as u64 {
-                println!("Invalid AFCPacket header received!");
+                debug!("Invalid AFCPacket header received!");
                 return AfcResponse::error();
             }
 
             if response_header.this_length == response_header.entire_length
                 && response_header.entire_length == std::mem::size_of::<AfcHeader>() as u64
             {
-                println!("Empty AFCPacket received!");
+                debug!("Empty AFCPacket received!");
                 return AfcResponse::error();
             }
 
@@ -354,12 +354,12 @@ impl Client {
                 };
 
                 if recv_bytes == 0 {
-                    println!("Did not get packet contents!");
+                    debug!("Did not get packet contents!");
                     return AfcResponse::error();
                 }
 
                 if recv_bytes < this_len as _ {
-                    println!("Could not receive this_len={:?} bytes", this_len);
+                    debug!("Could not receive this_len={:?} bytes", this_len);
                     return AfcResponse::error();
                 }
                 response.extend_from_slice(&buf[0..recv_bytes as usize]);
@@ -380,7 +380,7 @@ impl Client {
                         )
                     };
                     if recv_bytes == 0 {
-                        println!("Error receiving data (recv returned {:?})", recv_bytes);
+                        debug!("Error receiving data (recv returned {:?})", recv_bytes);
                         break;
                     }
 
@@ -389,7 +389,7 @@ impl Client {
                 }
 
                 if current_count < entire_len {
-                    println!(
+                    debug!(
                         "WARNING: could not receive full packet (read {:?}, size {:?})",
                         current_count, entire_len
                     );
