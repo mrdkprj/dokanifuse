@@ -4,12 +4,14 @@ fn main() {
     let lib_dir = std::path::Path::new(&root).join("lib");
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_dir = std::path::Path::new(&out_dir);
+    let exe_dir = out_dir.ancestors().nth(3).unwrap();
+
     for lib in std::fs::read_dir(lib_dir).unwrap() {
         let lib_path = lib.unwrap();
-        std::fs::copy(lib_path.path(), out_dir.join(lib_path.file_name())).unwrap();
+        std::fs::copy(lib_path.path(), exe_dir.join(lib_path.file_name())).unwrap();
     }
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-search=native={}", exe_dir.display());
 
     println!("cargo:rustc-link-lib=dylib=dokan2");
     println!("cargo:rustc-link-lib=dylib=dokanfuse2");

@@ -1,6 +1,11 @@
 #![allow(non_camel_case_types, non_upper_case_globals, dead_code)]
 #![allow(clippy::upper_case_acronyms)]
-use crate::{bindings::*, debug};
+use crate::{
+    afc_error_t, afc_error_t_AFC_E_UNKNOWN_ERROR, afc_file_mode_t, debug, idevice_connect,
+    idevice_connection_enable_ssl, idevice_connection_receive_timeout, idevice_connection_send,
+    idevice_connection_t, idevice_disconnect, idevice_error_t, idevice_error_t_IDEVICE_E_SUCCESS,
+    idevice_error_t_IDEVICE_E_TIMEOUT, idevice_private, lockdownd_service_descriptor,
+};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
 use std::{collections::HashMap, ffi::CStr, mem::MaybeUninit, slice::from_raw_parts, sync::Mutex};
@@ -78,18 +83,6 @@ impl Client {
         device: *mut idevice_private,
         service: *mut lockdownd_service_descriptor,
     ) -> Option<Self> {
-        let mut udid: *mut ::std::os::raw::c_char = std::ptr::null_mut();
-        unsafe { idevice_get_udid(device, &mut udid) };
-
-        let mut usbdev = MaybeUninit::<usbmuxd_device_info_t>::zeroed();
-        let usbdev_ptr = usbdev.as_mut_ptr();
-
-        if unsafe { usbmuxd_get_device(udid, usbdev_ptr, idevice_options_IDEVICE_LOOKUP_USBMUX) }
-            == 0
-        {
-            return None;
-        }
-
         let mut device_connection = MaybeUninit::<idevice_connection_t>::zeroed();
         let device_connection_ptr = device_connection.as_mut_ptr();
         if unsafe { idevice_connect(device, (*service).port, device_connection_ptr) }
@@ -299,7 +292,7 @@ impl Client {
                     /* check if it's a valid AFC header */
                     /* check if it has the correct packet number */
                     if AFCMAGIC != &response_magic || packet_num != response_packet_pnum {
-                        debug!("Invalid response header");
+                        eprintln!("Invalid response header");
                         None
                     } else {
                         Some(response_header)
@@ -309,11 +302,11 @@ impl Client {
                 }
             }
             idevice_error_t_IDEVICE_E_TIMEOUT => {
-                debug!("TCP timeout");
+                eprintln!("TCP timeout");
                 None
             }
             val => {
-                debug!("TCP error: {:?}", val);
+                eprintln!("TCP error: {:?}", val);
                 None
             }
         };

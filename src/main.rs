@@ -3,6 +3,7 @@ mod afc;
 mod bindings;
 mod housearrest;
 mod instproxy;
+use crate::instproxy::print_app;
 use afc::*;
 pub(crate) use bindings::*;
 use clap::{arg, Args, Parser};
@@ -13,8 +14,6 @@ use std::{
     os::raw::c_void,
     str,
 };
-
-use crate::instproxy::print_app;
 
 const AFC_SERVICE_NAME: &str = "com.apple.afc";
 const HOUSE_ARREST_SERVICE_NAME: &str = "com.apple.mobile.house_arrest";
@@ -28,8 +27,8 @@ struct Cli {
     mount_point: Option<String>,
 
     /// Use house_arrest service.
-    #[arg(short, long, requires = "mount", value_name = "App Id")]
-    house_arrest: Option<String>,
+    #[arg(short, long, requires = "mount", value_name = "appid")]
+    documents: Option<String>,
 
     #[command(flatten)]
     vers: Option<ListApps>,
@@ -107,26 +106,31 @@ fn main() {
     }
 
     let mount_point = args.mount_point.unwrap_or_default();
+    let mp = mount_point.clone();
     ctrlc::set_handler(move || {
-        if !mount_point.is_empty() {
-            println!("Received Ctrl+C, unmounting...:{:?}", mount_point);
-            let mount_point = CString::new(mount_point.clone()).unwrap();
-            unsafe { fuse_unmount(mount_point.as_ptr(), std::ptr::null_mut()) };
+        if !mp.is_empty() {
+            println!("Unmounting...:{:?}", mp);
+            let c = CString::new(mp.clone()).unwrap();
+            unsafe { fuse_unmount(c.as_ptr(), std::ptr::null_mut()) };
         }
     })
     .expect("Error setting Ctrl-C handler");
 
     VERBOSE.get_or_init(|| args.verbose);
     let list_apps = args.vers.is_some();
-    let app_id = args.house_arrest.unwrap_or_default();
+    let app_id = args.documents.unwrap_or_default();
     let mut opt = Vec::new();
     if !list_apps {
-        for arg in argv.into_iter() {
-            let c = CString::new(arg).unwrap();
-            opt.push(c.into_raw());
-        }
+        // exe name
+        let exe_name = argv.first().unwrap();
+        let c = CString::new(exe_name.clone()).unwrap();
+        opt.push(c.into_raw());
 
-        // Must run in foreground
+        // mount point
+        let c = CString::new(mount_point.clone()).unwrap();
+        opt.push(c.into_raw());
+
+        // must run in foreground
         let c = CString::new("-f").unwrap();
         opt.push(c.into_raw());
     }
@@ -142,7 +146,7 @@ fn main() {
         )
     };
     if res != idevice_error_t_IDEVICE_E_SUCCESS {
-        debug!("No device found");
+        eprintln!("No device found:{:?}", res);
         return;
     }
 
@@ -155,7 +159,7 @@ fn main() {
     let res =
         unsafe { lockdownd_client_new_with_handshake(device, client_ptr, program_name.as_ptr()) };
     if res != lockdownd_error_t_LOCKDOWN_E_SUCCESS || client_ptr.is_null() {
-        debug!("lockdown failed:{:?}", res);
+        eprintln!("lockdown failed:{:?}", res);
         unsafe { idevice_free(device) };
         return;
     }
@@ -184,7 +188,7 @@ fn main() {
     let descriptor_ptr = descriptor.as_mut_ptr();
     let res = unsafe { lockdownd_start_service(client, service_name.as_ptr(), descriptor_ptr) };
     if res != lockdownd_error_t_LOCKDOWN_E_SUCCESS || descriptor_ptr.is_null() {
-        debug!("lockdownd_start_service failed:{:?}", res);
+        eprintln!("lockdownd_start_service failed:{:?}", res);
         unsafe { lockdownd_client_free(client) };
         unsafe { idevice_free(device) };
         return;
@@ -206,7 +210,7 @@ fn main() {
         }
 
         if use_house_arrest && afc_client.start_house_arrest(app_id) < 0 {
-            debug!("Cannot start_house_arrest");
+            eprintln!("Cannot start_house_arrest");
             unsafe { lockdownd_client_free(client) };
             unsafe { idevice_free(device) };
             return;
@@ -214,7 +218,7 @@ fn main() {
 
         CLIENT.get_or_init(|| afc_client);
     } else {
-        debug!("Cannot create AfcClient");
+        eprintln!("Cannot create AfcClient");
         unsafe { lockdownd_client_free(client) };
         unsafe { idevice_free(device) };
         return;
@@ -231,7 +235,7 @@ fn main() {
 
     let operations = get_fuse_operations();
 
-    println!("Start dokanifuse");
+    debug!("Starting ifuse");
 
     unsafe {
         fuse_main_real(
